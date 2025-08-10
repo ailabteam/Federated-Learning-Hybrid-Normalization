@@ -1,8 +1,8 @@
-# client.py
+# client.py (Full Code)
 import torch
 import flwr as fl
 from collections import OrderedDict
-from models import get_model
+from models import get_model # This will be updated to get_model(norm_type)
 
 # Check if CUDA is available and set the device
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -22,6 +22,9 @@ def train(net, trainloader, epochs):
 
 def test(net, testloader):
     """Validate the model on the test set."""
+    if not testloader:
+        return 0.0, 0.0 # Handle case where client testloader is None
+
     criterion = torch.nn.CrossEntropyLoss()
     correct, total, loss = 0, 0, 0.0
     net.eval()
@@ -34,16 +37,12 @@ def test(net, testloader):
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
     
-    # Check if total is zero to avoid division by zero
     if total == 0:
-        return loss, 0.0
+        return 0.0, 0.0
         
     accuracy = correct / total
     return loss / len(testloader.dataset), accuracy
 
-# Flower's warning suggests converting NumPyClient to a Client.
-# We keep NumPyClient for its simplicity, as it's perfect for research simulations.
-# The following class remains unchanged, the conversion will happen in client_fn.
 class FlowerClient(fl.client.NumPyClient):
     def __init__(self, cid, net, trainloader, testloader):
         self.cid = cid
@@ -52,18 +51,42 @@ class FlowerClient(fl.client.NumPyClient):
         self.testloader = testloader
 
     def get_parameters(self, config):
-        # No need for print statements here, they add clutter
-        return [val.cpu().numpy() for _, val in self.net.state_dict().items()]
+        """Get model parameters, optionally filtering for FedBN."""
+        # If FedBN is enabled in the config, filter out BN parameters
+        if config.get("fedbn", False):
+            # Find all keys that are not part of a BatchNorm layer
+            non_bn_keys = [key for key in self.net.state_dict().keys() if "bn" not in key]
+            # Return the corresponding values
+            return [self.net.state_dict()[key].cpu().numpy() for key in non_bn_keys]
+        else:
+            # Default behavior: return all parameters
+            return [val.cpu().numpy() for _, val in self.net.state_dict().items()]
 
     def set_parameters(self, parameters):
-        params_dict = zip(self.net.state_dict().keys(), parameters)
-        state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
-        self.net.load_state_dict(state_dict, strict=True)
+        """Set model parameters, handling both FedAvg and FedBN."""
+        all_keys = self.net.state_dict().keys()
+        
+        # Check if the number of received parameters is less than the total number
+        # This is a strong indicator of FedBN.
+        if len(parameters) < len(all_keys):
+            # Get the keys for non-BN layers
+            non_bn_keys = [key for key in all_keys if "bn" not in key]
+            params_dict = zip(non_bn_keys, parameters)
+            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            # Load the non-BN parameters, keeping the client's local BN params
+            self.net.load_state_dict(state_dict, strict=False)
+        else:
+            # FedAvg: load all parameters
+            params_dict = zip(all_keys, parameters)
+            state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
+            self.net.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        train(self.net, self.trainloader, epochs=config["local_epochs"])
-        return self.get_parameters(config={}), len(self.trainloader.dataset), {}
+        epochs = config.get("local_epochs", 1)
+        train(self.net, self.trainloader, epochs=epochs)
+        # Pass the config to get_parameters to enable FedBN logic
+        return self.get_parameters(config=config), len(self.trainloader.dataset), {}
 
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
